@@ -8,11 +8,9 @@ const firebaseConfig = {
     appId: "YOUR_APP_ID"
 };
 
-try {
-    firebase.initializeApp(firebaseConfig);
-} catch(e) {}
-
+firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
+const auth = firebase.auth();
 
 window.state = {
     activeTab: "channels",
@@ -20,19 +18,26 @@ window.state = {
     isDM: false,
     replyContext: null,
     targetMessageIdForReaction: null,
-    user: {
-        uid: "usr_" + Math.floor(1000 + Math.random() * 9000),
-        name: "Guest",
-        avatar: "default.png"
-    }
+    user: null
 };
 
 document.addEventListener("DOMContentLoaded", () => {
-    document.getElementById("account-name").innerText = window.state.user.name;
-    document.getElementById("account-avatar").src = window.state.user.avatar;
-    switchTab("channels");
-    initPresence();
-    loadMessages();
+    auth.onAuthStateChanged(user => {
+        if (user) {
+            window.state.user = {
+                uid: user.uid,
+                name: user.displayName || "User_" + user.uid.substring(0, 5),
+                avatar: user.photoURL || "default.png"
+            };
+            document.getElementById("account-name").innerText = window.state.user.name;
+            document.getElementById("account-avatar").src = window.state.user.avatar;
+            switchTab("channels");
+            initPresence();
+            loadMessages();
+        } else {
+            auth.signInAnonymously();
+        }
+    });
 });
 
 function switchTab(tabName) {
@@ -68,45 +73,43 @@ function switchLocation(type, id, displayName = null) {
 }
 
 function initPresence() {
-    try {
-        const statusRef = db.ref(`/status/${window.state.user.uid}`);
-        const onlineState = { state: "online", ...window.state.user };
-        const offlineState = { state: "offline", ...window.state.user };
+    const statusRef = db.ref(`/status/${window.state.user.uid}`);
+    const onlineState = { state: "online", ...window.state.user };
+    const offlineState = { state: "offline", ...window.state.user };
 
-        db.ref(".info/connected").on("value", (snap) => {
-            if (snap.val() === false) return;
-            statusRef.onDisconnect().set(offlineState).then(() => {
-                statusRef.set(onlineState);
-            });
+    db.ref(".info/connected").on("value", (snap) => {
+        if (snap.val() === false) return;
+        statusRef.onDisconnect().set(offlineState).then(() => {
+            statusRef.set(onlineState);
+        });
+    });
+
+    db.ref("/status").on("value", (snap) => {
+        const onGroup = document.getElementById("group-online");
+        const offGroup = document.getElementById("group-offline");
+        onGroup.innerHTML = "";
+        offGroup.innerHTML = "";
+        let onCnt = 0, offCnt = 0;
+
+        snap.forEach(child => {
+            const u = child.val();
+            const el = document.createElement("div");
+            el.className = "member-row";
+            el.innerHTML = `<img src="${u.avatar || 'default.png'}"><span>${u.name}</span>`;
+            el.onclick = () => openUserModal(u.uid, u.name, u.avatar);
+
+            if (u.state === "online") {
+                onGroup.appendChild(el);
+                onCnt++;
+            } else {
+                offGroup.appendChild(el);
+                offCnt++;
+            }
         });
 
-        db.ref("/status").on("value", (snap) => {
-            const onGroup = document.getElementById("group-online");
-            const offGroup = document.getElementById("group-offline");
-            onGroup.innerHTML = "";
-            offGroup.innerHTML = "";
-            let onCnt = 0, offCnt = 0;
-
-            snap.forEach(child => {
-                const u = child.val();
-                const el = document.createElement("div");
-                el.className = "member-row";
-                el.innerHTML = `<img src="${u.avatar || 'default.png'}"><span>${u.name}</span>`;
-                el.onclick = () => openUserModal(u.uid, u.name, u.avatar);
-
-                if (u.state === "online") {
-                    onGroup.appendChild(el);
-                    onCnt++;
-                } else {
-                    offGroup.appendChild(el);
-                    offCnt++;
-                }
-            });
-
-            document.getElementById("cnt-online").innerText = onCnt;
-            document.getElementById("cnt-offline").innerText = offCnt;
-        });
-    } catch(e) {}
+        document.getElementById("cnt-online").innerText = onCnt;
+        document.getElementById("cnt-offline").innerText = offCnt;
+    });
 }
 
 function loadMessages() {
@@ -117,17 +120,22 @@ function loadMessages() {
         ? `dms/${window.state.currentLocation}` 
         : `messages/${window.state.currentLocation}`;
 
-    try {
-        db.ref(path).off();
-        db.ref(path).on("child_added", (snap) => {
-            renderMessage(snap.key, snap.val());
-        });
-        db.ref(path).on("child_changed", (snap) => {
-            if(window.updateMessageReactions) {
-                window.updateMessageReactions(snap.key, snap.val().reactions);
-            }
-        });
-    } catch(e) {}
+    db.ref(path).off();
+    
+    db.ref(path).on("child_added", (snap) => {
+        renderMessage(snap.key, snap.val());
+    });
+    
+    db.ref(path).on("child_changed", (snap) => {
+        if(window.updateMessageReactions) {
+            window.updateMessageReactions(snap.key, snap.val().reactions);
+        }
+    });
+    
+    db.ref(path).on("child_removed", (snap) => {
+        const msgElement = document.getElementById(`msg-${snap.key}`);
+        if (msgElement) msgElement.remove();
+    });
 }
 
 function renderMessage(id, msg) {
@@ -157,6 +165,7 @@ function renderMessage(id, msg) {
             <div class="msg-actions">
                 <button class="action-btn" onclick="openReactionPicker('${id}')"><i class="fa-solid fa-face-smile"></i></button>
                 <button class="action-btn" onclick="triggerReply('${id}', '${msg.name}', '${msg.text}')"><i class="fa-solid fa-reply"></i></button>
+                <button class="action-btn" style="color: #ff5555; border-color: #ff555544;" onclick="deleteMessage('${id}')"><i class="fa-solid fa-trash"></i></button>
             </div>
         </div>
     `;
@@ -168,6 +177,14 @@ function renderMessage(id, msg) {
     viewport.scrollTop = viewport.scrollHeight;
 }
 
+window.deleteMessage = function(id) {
+    const path = window.state.isDM 
+        ? `dms/${window.state.currentLocation}/${id}` 
+        : `messages/${window.state.currentLocation}/${id}`;
+    
+    db.ref(path).remove();
+}
+
 function handleInputKeypress(e) {
     if (e.key === "Enter") sendMessage();
 }
@@ -175,7 +192,7 @@ function handleInputKeypress(e) {
 function sendMessage() {
     const input = document.getElementById("chat-input");
     const val = input.value.trim();
-    if (!val) return;
+    if (!val || !window.state.user) return;
 
     const path = window.state.isDM 
         ? `dms/${window.state.currentLocation}` 
@@ -186,7 +203,7 @@ function sendMessage() {
         name: window.state.user.name,
         avatar: window.state.user.avatar,
         text: val,
-        timestamp: firebase.database.ServerValue.TIMESTAMP || Date.now()
+        timestamp: firebase.database.ServerValue.TIMESTAMP
     };
 
     if (window.state.replyContext) {
@@ -194,12 +211,7 @@ function sendMessage() {
         if(window.clearReply) window.clearReply();
     }
 
-    try {
-        db.ref(path).push(payload);
-    } catch(e) {
-        const localId = "local_" + Date.now();
-        renderMessage(localId, payload);
-    }
+    db.ref(path).push(payload);
     input.value = "";
 }
 
